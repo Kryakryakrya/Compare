@@ -3,16 +3,24 @@
 
 #include "framework.h"
 #include "Graphic.Ui.h"
+#include <strsafe.h>
 
 UINT const WMAPP_NOTIFYCALLBACK = WM_APP + 1;
+typedef std::basic_string<TCHAR> Tstring;
+#define MAX_LOADSTRING 100
+std::deque<Tstring> commandDeque; // Вектор команд
+std::mutex commandMutex; // Мьютекс для защиты доступа к вектору команд
+std::condition_variable commandCondition; // Условная переменная для ожидания новых команд
 OPENFILENAME ofn;
-wchar_t filename[260];
+TCHAR szFile[MAX_PATH] = { 0 };
+LPTSTR pathFolder;
+BROWSEINFO bi = { 0 };
+LPITEMIDLIST pidl;
 // {80C59810-7034-41C9-A9B0-EBE65B98F52B}
 static const GUID iconGuid =
 { 0x80c59810, 0x7034, 0x41c9, { 0xa9, 0xb0, 0xeb, 0xe6, 0x5b, 0x98, 0xf5, 0x2b } };
 
-typedef std::basic_string<TCHAR> Tstring;
-#define MAX_LOADSTRING 100
+
 
 // Глобальные переменные:
 HINSTANCE hInst;                                // текущий экземпляр
@@ -27,12 +35,13 @@ INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
 BOOL AddNotificationIcon(HWND hwnd);
 BOOL DeleteNotificationIcon();
 void ShowContextMenu(HWND hwnd, POINT pt);
-void SetOpenFileParams(HWND hWnd);
 BOOL Read(HANDLE handle, uint8_t* data, uint64_t length, DWORD& bytesRead);
 BOOL Write(HANDLE handle, uint8_t* data, uint64_t length);
 HANDLE ConnectToServerPipe(const Tstring& name, uint32_t timeout);
 Tstring GetErrorAsString(DWORD errorMessegeID);
-void SendFile(HWND hwnd, OPENFILENAME& ofn);
+SECURITY_ATTRIBUTES GetSecurityAttributes(const Tstring& sddl);
+Tstring GetCurrentUserSid();
+Tstring GetUserSid(HANDLE userToken);
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
                      _In_opt_ HINSTANCE hPrevInstance,
@@ -43,7 +52,54 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     UNREFERENCED_PARAMETER(hPrevInstance);
     UNREFERENCED_PARAMETER(lpCmdLine);
 
-    // TODO: Разместите код здесь.
+
+    int nArgs;
+    LPTSTR* arglist = CommandLineToArgvW(GetCommandLine(), &nArgs);
+
+    if (NULL == arglist)
+        return -1;
+
+    if (nArgs > 1)
+    {
+        if (arglist[1] == Tstring(__TEXT("--secure-desktop")))
+        {
+            HDESK hCurrentDesktop = OpenInputDesktop(
+                0,
+                TRUE,
+                DESKTOP_SWITCHDESKTOP
+            );
+
+            auto sddl = std::format(__TEXT("O:{0}G:{0}D:"), GetCurrentUserSid());
+            auto security = GetSecurityAttributes(sddl);
+
+            HDESK hDesk = CreateDesktop(
+                __TEXT("AntimalwareCD"),
+                NULL,
+                NULL,
+                0,
+                DESKTOP_CREATEWINDOW | DESKTOP_SWITCHDESKTOP,
+                &security
+            );
+
+            SetThreadDesktop(hDesk);
+
+            if (!SwitchDesktop(hDesk))
+                return -1;
+
+            bool result = (IDYES == MessageBox(
+                NULL,
+                __TEXT("Are you shure?"),
+                __TEXT("Warning"),
+                MB_ICONINFORMATION | MB_YESNO));
+
+            SwitchDesktop(hCurrentDesktop);
+            SetThreadDesktop(hCurrentDesktop);
+
+            CloseDesktop(hDesk);
+            CloseDesktop(hCurrentDesktop);
+            return result ? 1 : 0;
+        }
+    }
 
     // Инициализация глобальных строк
     LoadStringW(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
@@ -126,24 +182,53 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
    /*ShowWindow(hWnd, nCmdShow);
    UpdateWindow(hWnd);*/
    AddNotificationIcon(hWnd);
-   //std::thread clientThread([hWnd]()
-   //    {
-   //        DWORD sessionId;
-   //        ProcessIdToSessionId(GetCurrentProcessId(), &sessionId);
+   std::thread clientThread([hWnd]()
+       {
+           DWORD sessionId;
+           ProcessIdToSessionId(GetCurrentProcessId(), &sessionId);
 
-   //        Tstring path{ std::format(__TEXT("\\\\.\\pipe\\AntimalwareServiceIPC\\{}"), sessionId) };
-   //        HANDLE pipe = ConnectToServerPipe(path, NMPWAIT_WAIT_FOREVER);
+           Tstring path{ std::format(__TEXT("\\\\.\\pipe\\AntimalwareServiceIPC\\{}"), sessionId) };
+           HANDLE pipe = ConnectToServerPipe(path, NMPWAIT_WAIT_FOREVER);
+           DWORD length = 0;
+           Tstring command;
+           while (true) {
+               // Ждем новой команды
+               {
+                   std::unique_lock<std::mutex> lock(commandMutex);
+                   commandCondition.wait(lock, []
+                       {
+                           return !commandDeque.empty();
+                       });
+                   // Получаем команду из очереди
+                   command = commandDeque.front();
+                   commandDeque.pop_front();
+               }
 
-   //        DWORD length = 0;
-   //        uint8_t  buff[] = "Hello";
-   //        Write(pipe, buff, 6);
+               // Отправляем команду сервису
+               Write(pipe, reinterpret_cast<uint8_t*>(command.data()), 512);
 
-   //        uint8_t  buff2[6] = {};
-   //        Read(pipe, buff2, 6, length);
+               uint8_t  buff2[6] = {};
+               Read(pipe, buff2, 6, length);
+              
+               // Отображаем результат сканирования в виде алерта
+               if (buff2[0] == 'V') {
+                   MessageBox(hWnd, __TEXT("Обнаружен вирус!"), __TEXT("Результат сканирования"), MB_OK | MB_ICONERROR);
+               }
+               else if (buff2[0] == 'N') {
+                   MessageBox(hWnd, __TEXT("Не обнаружен вирус."), __TEXT("Результат сканирования"), MB_OK | MB_ICONINFORMATION);
+               }
+               else if (buff2[0] == 'D') {
+                   MessageBox(hWnd, TEXT("Выбранный путь является папкой."), TEXT("Результат сканирования"), MB_OK | MB_ICONINFORMATION);
+               }
+               else {
+                   MessageBox(hWnd, __TEXT("Ошибка при сканировании."), __TEXT("Результат сканирования"), MB_OK | MB_ICONWARNING);
+               }
+           }
 
-   //        MessageBoxA(hWnd, (char*)buff2, "Info", MB_OK | MB_ICONINFORMATION); // !!!
-   //    });
-   //clientThread.detach();
+           CloseHandle(pipe);
+       });
+   clientThread.detach();
+
    return TRUE;
 }
 
@@ -176,16 +261,79 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
                 break;
             case ID_EXIT:
             case IDM_EXIT:
-                if (IDYES == MessageBox(hWnd, __TEXT("Are you sure?"), __TEXT("Confirmation"), MB_ICONINFORMATION | MB_YESNO)) {
-                    DeleteNotificationIcon();
-                    DestroyWindow(hWnd);
+                // Помещаем команду на выход в вектор команд
+                // Добавляем команду в очередь
+            {
+                std::lock_guard<std::mutex> lock(commandMutex);
+                commandDeque.push_front(__TEXT("Q"));
+            }
+            // Оповещаем ожидающий поток о наличии новой команды
+            commandCondition.notify_one();
+            break;
+            case IDM_SCAN:
+                // Структура для настройки диалога выбора файла
+
+                // Инициализация структуры
+                ZeroMemory(&ofn, sizeof(ofn));
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = hWnd;
+                ofn.lpstrFile = szFile;
+                ofn.lpstrFile[0] = '\0';
+                ofn.nMaxFile = sizeof(szFile);
+                ofn.lpstrFilter = __TEXT("All Files\0*.*\0");
+                ofn.nFilterIndex = 1;
+                ofn.lpstrInitialDir = NULL;
+                ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+
+                // Открытие диалога выбора файла
+                if (GetOpenFileName(&ofn) == TRUE)
+                {
+                    // Получение выбранного пути к файлу в szFile
+
+                    Tstring filePath(szFile);
+
+                    // Помещаем путь на выход в вектор команд
+                    // Добавляем команду в очередь
+                    {
+                        std::lock_guard<std::mutex> lock(commandMutex);
+                        commandDeque.push_front(filePath);
+                    }
+                    // Оповещаем ожидающий поток о наличии новой команды
+                    commandCondition.notify_one();
                 }
                 break;
-            case IDM_SCAN:
-                SetOpenFileParams(hWnd);
-                if (GetOpenFileName(&ofn)) {
-                    SendFile(hWnd, ofn);
+            case IDM_SCAN_FOLDER:
+                // Структура для диалога выбора папки
+                IFileDialog* pfd;
+                if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd))))
+                {
+                    DWORD dwOptions;
+                    if (SUCCEEDED(pfd->GetOptions(&dwOptions)))
+                    {
+                        pfd->SetOptions(dwOptions | FOS_PICKFOLDERS);
+                    }
+                    if (SUCCEEDED(pfd->Show(NULL)))
+                    {
+                        IShellItem* psi;
+                        if (SUCCEEDED(pfd->GetResult(&psi)))
+                        {
+                            if (!SUCCEEDED(psi->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &pathFolder)))
+                            {
+                                MessageBox(NULL, __TEXT("GetIDListName() failed"), NULL, NULL);
+                            }
+                            psi->Release();
+                        }
+                    }
+                    pfd->Release();
                 }
+
+                // Помещаем путь на выход в вектор команд
+                    // Добавляем команду в очередь
+                {
+                    std::lock_guard<std::mutex> lock(commandMutex);
+                    commandDeque.push_front(pathFolder);
+                }
+                commandCondition.notify_one();
                 break;
             default:
                 return DefWindowProc(hWnd, message, wParam, lParam);
@@ -395,39 +543,63 @@ Tstring GetErrorAsString(DWORD errorMessegeID)
     return messege;
 }
 
-void SetOpenFileParams(HWND hWnd)
-{
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = hWnd;
-    ofn.lpstrFile = filename;
-    ofn.nMaxFile = sizeof(filename);
-    ofn.lpstrFilter = L"All Files\0*.*\0";
-    ofn.lpstrFileTitle = NULL;
-    ofn.nMaxFileTitle = 0;
-    ofn.lpstrInitialDir = NULL;
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+Tstring GetUserSid(HANDLE userToken) {
+
+    Tstring userSid;
+    DWORD err = 0;
+    LPVOID pvInfo = NULL;
+    DWORD cbSize = 0;
+
+    if (!GetTokenInformation(userToken, TokenUser, NULL, 0, &cbSize))
+    {
+        err = GetLastError();
+        if (err == ERROR_INSUFFICIENT_BUFFER)
+        {
+            err = 0;
+            pvInfo = LocalAlloc(LPTR, cbSize);
+
+            if (!pvInfo)
+                err = ERROR_OUTOFMEMORY;
+            else if (!GetTokenInformation(userToken, TokenUser, pvInfo, cbSize, &cbSize))
+                err = GetLastError();
+            else
+            {
+                err = 0;
+                const TOKEN_USER* pUser = (const TOKEN_USER*)pvInfo;
+                LPTSTR userSidBuf;
+                ConvertSidToStringSid(pUser->User.Sid, &userSidBuf);
+                userSid.assign(userSidBuf);
+                LocalFree(userSidBuf);
+            }
+        }
+    }
+
+    return userSid;
 }
 
-void SendFile(HWND hWnd, OPENFILENAME& ofn)
-{   
-    std::thread sendThread([&ofn]() {
-        DWORD sessionId;
-        ProcessIdToSessionId(GetCurrentProcessId(), &sessionId);
-        Tstring path{ std::format(__TEXT("\\\\.\\pipe\\AntimalwareServiceIPC\\{}"), sessionId) };
-        HANDLE pipe = ConnectToServerPipe(path, NMPWAIT_WAIT_FOREVER);
-        if (pipe == INVALID_HANDLE_VALUE)
-        {
-            MessageBox(nullptr, L"Failed to connect to the pipe.", L"Error", MB_OK | MB_ICONERROR);
-            return;
-        }
-        uint8_t* data = reinterpret_cast<uint8_t*>(ofn.lpstrFile);
-        uint64_t length = sizeof(data);
-        if (!Write(pipe, data, length)) {
-            MessageBox(nullptr, L"Failed to write to the pipe.", L"Error", MB_OK | MB_ICONERROR);
-            return;
-        }
-        CloseHandle(pipe);
-    });
-    sendThread.detach();
+Tstring GetCurrentUserSid() {
+
+    HANDLE token;
+
+    if (!OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, FALSE, &token))
+    {
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+            return __TEXT("");
+    }
+    return GetUserSid(token);
 }
+
+SECURITY_ATTRIBUTES GetSecurityAttributes(const Tstring& sddl) {
+
+    SECURITY_ATTRIBUTES securityAttributes{};
+    securityAttributes.nLength = sizeof(SECURITY_ATTRIBUTES);
+    securityAttributes.bInheritHandle = TRUE;
+
+    PSECURITY_DESCRIPTOR psd = nullptr;
+
+    if (ConvertStringSecurityDescriptorToSecurityDescriptor(sddl.c_str(), SDDL_REVISION_1, &psd, nullptr))
+        securityAttributes.lpSecurityDescriptor = psd;
+
+    return securityAttributes;
+}
+

@@ -88,6 +88,9 @@ void FileStream::SetCurrentPosition(int64_t position, MoveMethod moveMethod)
 	LARGE_INTEGER newPosition = { 0 };
 	LARGE_INTEGER currentPosition = { 0 };
 	SetFilePointerEx(m_handle, newPosition, &currentPosition, ConvertMoveMethod(moveMethod));
+	//LARGE_INTEGER currentPosition = { 0 };
+	newPosition.QuadPart += position;
+	SetFilePointerEx(m_handle, newPosition, nullptr, ConvertMoveMethod(moveMethod));
 }
 int64_t FileStream::GetSize() const
 {

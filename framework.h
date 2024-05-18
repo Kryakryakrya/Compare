@@ -17,4 +17,9 @@
 #include <string>
 #include <thread>
 #include <format>
-#include <commdlg.h>
+#include "SDDL.h"
+#include <deque>
+#include <mutex>
+#include <condition_variable>
+#include <Commdlg.h>
+#include <shlobj_core.h>

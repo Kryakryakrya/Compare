@@ -65,6 +65,8 @@ bool BinarySerializer::ReadString(std::string& data)
 	uint64_t size = 0;
 	if (ReadUInt64(size))
 	{
+		WriteLog("size = ");
+		WriteLog(size);
 		data.resize(size);
 		return m_stream->Read(reinterpret_cast<uint8_t*>(data.data()), size);
 
@@ -74,7 +76,6 @@ bool BinarySerializer::ReadString(std::string& data)
 bool BinarySerializer::ReadBlob(std::vector<uint8_t>& data)
 {
 	uint32_t bytesRead = m_stream->Read(reinterpret_cast<uint8_t*>(data.data()), data.size());
-	WriteLog(bytesRead);
 	if (bytesRead > 0)
 	{
 		if (bytesRead != data.size())

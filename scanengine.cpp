@@ -6,15 +6,18 @@ bool ScanEngine::Scan(const std::shared_ptr<IRandomAccessStream> stream, std::st
 {
 	if (!stream)
 	{
+		std::cout << "error stream" << std::endl;
 		return false;
 	}
 	BinarySerializer s(stream);
 	do
 	{
 		uint64_t position = stream->GetCurrentPosition();
+		std::cout << "position = " << position << std::endl;
 		uint64_t prefix;
 		if (!s.ReadUInt64(prefix))
 		{
+			std::cout << "prefix = " << prefix << std::endl;
 			return false;
 		}
 		auto records = bases->FindRecord(prefix);
@@ -24,7 +27,7 @@ bool ScanEngine::Scan(const std::shared_ptr<IRandomAccessStream> stream, std::st
 			{
 				continue;
 			}
-			stream->SetCurrentPosition(position, MoveMethod::Begin);
+			stream->SetCurrentPosition(-8, MoveMethod::Current);
 			std::vector<uint8_t> data(record.len);
 			s.ReadBlob(data);
 			auto hash = GetDataHash(data.data(), data.size(), HashType::HashSha256);
@@ -34,7 +37,7 @@ bool ScanEngine::Scan(const std::shared_ptr<IRandomAccessStream> stream, std::st
 				return true;
 			}
 		}
-		stream->SetCurrentPosition(1, MoveMethod::Current);
+		//stream->SetCurrentPosition(4, MoveMethod::Current);
 	} while (true);
 }
 

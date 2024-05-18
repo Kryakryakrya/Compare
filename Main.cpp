@@ -1,4 +1,4 @@
-#include "Header.h"
+﻿#include "Header.h"
 
 #define serviceName __TEXT("AntiMalvareService3")
 //#define BUFSIZE 512
@@ -7,7 +7,12 @@ SERVICE_STATUS ServiceStatus = { 0 };
 SERVICE_STATUS_HANDLE hServiceStatusHandle = NULL;
 HANDLE hServiceEvent = NULL;
 std::wofstream errorLog;
-
+std::vector<HANDLE> uiHandlesVector;
+std::mutex uiMutex;
+std::u16string signatureFilePath = u"C:\\Users\\79195\\Desktop\\RBPO\\AntimalvareService\\av3.bin";
+AvBasesLoader basesLoader = AvBasesLoader();
+auto bases = basesLoader.LoadBases(signatureFilePath);
+ScanEngine scanEngine(bases);
 void WINAPI SvcMain(DWORD argc, TCHAR** argv);
 DWORD WINAPI SvcCtrlHandler(DWORD dwControl, DWORD dwEventType, LPVOID dwEventData, LPVOID dwContent);
 void StartUiProcessInSession(DWORD wtsSession);
@@ -21,6 +26,7 @@ Tstring GetUserID(HANDLE userToken);
 SECURITY_ATTRIBUTES GetSecurityAttributes(const Tstring& sdd1);
 BOOL Read(HANDLE handle, uint8_t* data, uint64_t lenght, DWORD& bytesRead);
 BOOL Write(HANDLE handle, uint8_t* data, uint64_t lenght);
+void ScanDirectory(const std::wstring& directoryPath, ScanEngine& scanEngine, uint8_t* resultBuffer);
 int _tmain(int argc, TCHAR* argv[])
 {
 	WriteLog(__TEXT("_tmain func Start..."));
@@ -77,7 +83,7 @@ void WINAPI SvcMain(DWORD argc, TCHAR** argv)
 
 
 	ServiceStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
-	ServiceStatus.dwControlsAccepted = SERVICE_ACCEPT_SESSIONCHANGE | SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+	ServiceStatus.dwControlsAccepted = SERVICE_ACCEPT_SESSIONCHANGE | SERVICE_ACCEPT_SHUTDOWN;
 	ServiceStatus.dwServiceSpecificExitCode = 0;
 	ServiceStatus.dwCurrentState = SERVICE_RUNNING;
 
@@ -92,11 +98,13 @@ void WINAPI SvcMain(DWORD argc, TCHAR** argv)
 	}
 	else 
 		WriteLog(__TEXT("Service status initial setup success...."));
-
+	
+	WriteLog(L"try open signatureBases");
+	if (bases == nullptr) {
+		WriteLog(std::format(__TEXT("Error: Failed open signatureBases")));
+	}
 	PWTS_SESSION_INFOW wtsSessions;
 	DWORD sessionsCount;
-
-
 	if (WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &wtsSessions, &sessionsCount))
 	{
 		WriteLog(std::format(__TEXT("WTSEnumerateSessionsW returns TRUE, sessionsCount = {}"), sessionsCount));
@@ -136,11 +144,11 @@ DWORD WINAPI SvcCtrlHandler(DWORD dwCtrl, DWORD dwEventType, LPVOID lpEventData,
 
 	switch (dwCtrl)
 	{
-	case SERVICE_CONTROL_STOP:
+	/*case SERVICE_CONTROL_STOP:
 		WriteLog(__TEXT("Service have been Stopped at...."));
 		ServiceStatus.dwCurrentState = SERVICE_STOPPED;
 		result = NO_ERROR;
-		break;
+		break;*/
 
 	case SERVICE_CONTROL_SHUTDOWN:
 		WriteLog(__TEXT("PC is going to SHUTDOWN stopping the Service...."));
@@ -176,9 +184,9 @@ void StartUiProcessInSession(DWORD wtsSession) {
 		if (WTSQueryUserToken(wtsSession, &userToken))
 		{
 
-			TCHAR commandLine[] = __TEXT("\"C:\\Users\\79195\\Desktop\\RBPO\\AntimalvareService\\x64\\Debug\\Graphic.Ui.exe");
+			TCHAR commandLine[] = __TEXT("\"C:\\Users\\79195\\Desktop\\RBPO\\AntimalvareService\\x64\\Debug\\Graphic.Ui.exe\"");
 			WriteLog(__TEXT("Starting  \"C:\\Users\\79195\\Desktop\\RBPO\\AntimalvareService\\x64\\Debug\\Graphic.Ui.exe"));
-
+			TCHAR sdCommandLine[] = __TEXT("\"C:\\Users\\79195\\Desktop\\RBPO\\AntimalvareService\\x64\\Debug\\Graphic.Ui.exe\" --secure-desktop");
 			Tstring processSddl = std::format(__TEXT("O:SYG:SYD:(D;OICI;0x{:08X};;;WD)(A;OICI;0x{:08X};;;WD)"), PROCESS_TERMINATE, PROCESS_ALL_ACCESS);
 			Tstring threadSddl = std::format(__TEXT("O:SYG:SYD:(D;OICI;0x{:08X};;;WD)(A;OICI;0x{:08X};;;WD)"), THREAD_TERMINATE, THREAD_ALL_ACCESS);
 
@@ -230,7 +238,12 @@ void StartUiProcessInSession(DWORD wtsSession) {
 					&si,
 					&pi))
 				{
+
 					WriteLog(__TEXT("Process created...."));
+					{
+						std::lock_guard<std::mutex> lock(uiMutex);
+						uiHandlesVector.push_back(pi.hProcess);
+					}
 					ULONG clientProcessId;
 					BOOL clientIndentified;
 					WriteLog(__TEXT("Check1"));
@@ -249,34 +262,88 @@ void StartUiProcessInSession(DWORD wtsSession) {
 
 
 					} while (true);
-					WriteLog(__TEXT("Check2"));
-
 					uint8_t buff[512];
 					DWORD bytesRead = 0;
 					std::u16string outPath = u"C:\\Users\\79195\\Desktop\\RBPO\\AntimalvareService\\output.bin";
 					FileStream out(outPath);
 					while (Read(pipe, buff, 512, bytesRead))
 					{
+						uint8_t buff2[6] = {0};
+						WriteLog(bytesRead);
 						ImpersonateNamedPipeClient(pipe);
-						out.Write(buff, bytesRead);
-						/*RevertToSelf();
-
-						Write(pipe, buff, bytesRead);*/
+						RevertToSelf();
+						DWORD exitCode;
+						if (bytesRead >= 1 && buff[0] == 'Q')
+						{
+							PROCESS_INFORMATION sdpi{};
+							STARTUPINFOW sdsi{};
+							if (CreateProcessAsUserW(
+								userToken,
+								NULL,
+								sdCommandLine,
+								&processSecurityAttributes,
+								&threadSecurityAttributes,
+								FALSE,
+								0,
+								NULL,
+								NULL,
+								&sdsi,
+								&sdpi))
+							{
+								if (WAIT_OBJECT_0 == WaitForSingleObject(sdpi.hProcess, INFINITE))
+								{
+									if (GetExitCodeProcess(sdpi.hProcess, &exitCode) && exitCode == 1)
+									{
+										{
+											std::lock_guard<std::mutex> lock(uiMutex);
+											for (auto& handle : uiHandlesVector)
+											{
+												TerminateProcess(handle, 0);
+											}
+										}
+										//TerminateProcess(GetCurrentProcess(), 0);
+										ServiceStatus.dwCurrentState = SERVICE_STOPPED;
+										SvcReportStatus(ServiceStatus.dwCurrentState, NO_ERROR, 0);
+										return;
+									}
+								}
+							}
+						}
+						if (bytesRead >= 1) {
+							std::wstring filePathW(reinterpret_cast<wchar_t*>(buff));
+							std::u16string filePathU(reinterpret_cast<char16_t*>(buff), 512);
+							DWORD attributes = GetFileAttributes(reinterpret_cast<LPCWSTR>(filePathU.c_str()));
+							if (attributes == INVALID_FILE_ATTRIBUTES) {
+								DWORD error = GetLastError();
+								WriteLog(std::format(TEXT("Ошибка при получении атрибутов файла или папки: {}"), error));
+								buff2[0] = 'E'; // Error
+							}
+							else if (attributes & FILE_ATTRIBUTE_DIRECTORY) {
+								WriteLog(TEXT("Полученный путь является папкой."));
+								ScanDirectory(filePathW, scanEngine, buff2);
+							}
+							else {
+								WriteLog(TEXT("Полученный путь является файлом."));
+								FileStream file(filePathU);
+								std::shared_ptr<IRandomAccessStream> stream = std::make_shared<FileStream>(file);
+								std::string malvareName;
+								bool scanResult = scanEngine.Scan(stream, malvareName);
+								if (scanResult) {
+									buff2[0] = 'V';
+									WriteLog("file have virus");
+								}
+								else {
+									buff2[0] = 'N';
+									WriteLog("file haven't virus");
+								}
+							}	
+						}
+						Write(pipe, buff2, 6);
 					}
 					WriteLog(__TEXT("Check3"));
 					WriteLog(L"End writing.");
-					std::u16string signatureFilePath = u"C:\\Users\\79195\\Desktop\\RBPO\\AntimalvareService\\signatures.bin";
-					AvBasesLoader basesLoader = AvBasesLoader();
-					auto bases = basesLoader.LoadBases(signatureFilePath);
-					WriteLog(L"try open signatureBases");
-					if (bases == nullptr) {
-						WriteLog(std::format(__TEXT("Error: Failed open signatureBases")));
-					}
-					else {
-						auto base = bases.get();
-						WriteLog(std::format(__TEXT("Open signatureBases succesfully")));
-					}
-					//CloseHandle(pipe);
+					
+					CloseHandle(pipe);
 					CloseHandle(pi.hThread);
 					CloseHandle(pi.hProcess);
 
@@ -634,6 +701,59 @@ Tstring GetUserID(HANDLE userToken) {
 	}
 
 	return userSid;
+}
+
+void ScanDirectory(const std::wstring& directoryPath, ScanEngine& scanEngine, uint8_t* resultBuffer) {
+
+	WIN32_FIND_DATA findFileData; //Ñòðóêòóðà õðàíèò èíôîðìàöèþ î ôàéëàõ è ïàïêàõ
+
+	HANDLE hFind = FindFirstFile((directoryPath + __TEXT("\\*")).c_str(), &findFileData); // ïåðâûé ôàéë èëè ïàïêà
+
+	if (hFind == INVALID_HANDLE_VALUE) {
+		WriteLog(__TEXT("Invalid directory handle."));
+		return;
+	}
+
+	do {
+		const std::wstring fileOrDirName = findFileData.cFileName; // èçâëåêàåì òåêóùåå èìÿ ôàéëà èëè ïàïêè
+
+		if (fileOrDirName == __TEXT(".") || fileOrDirName == __TEXT("..")) {
+			//Ïðîâåðêà íà ñïåöèàëüíûå ïàïêè "." è "..", êîòîðûå îáîçíà÷àþò òåêóùóþ è ðîäèòåëüñêóþ äèðåêòîðèè.
+			// Åñëè ýòî îíè, òî ïðîïóñêàåì èòåðàöèþ öèêëà.
+			continue;
+		}
+
+		const std::wstring fullPath = directoryPath + __TEXT("\\") + fileOrDirName; // ôîðìèðóåì ïðàâèëüíûé ïóòü ê ôàéëó èëè ïàïêå
+
+		if (findFileData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+			// Ðåêóðñèâíî ñêàíèðóåì âëîæåííóþ äèðåêòîðèþ
+			ScanDirectory(fullPath, scanEngine, resultBuffer);
+			if (resultBuffer[0] == 'V') {
+				break; // Ïðåêðàùàåì ñêàíèðîâàíèå ïðè íàõîæäåíèè âèðóñà
+			}
+		}
+		else {
+			WriteLog(std::format(__TEXT("Scanning file: {}"), fullPath));
+			std::u16string filePath(fullPath.begin(), fullPath.end());
+			FileStream file(filePath);
+
+			std::shared_ptr<IRandomAccessStream> stream = std::make_shared<FileStream>(file);
+			std::string malwareName;
+
+			bool scanResult = scanEngine.Scan(stream, malwareName);
+			if (scanResult) {
+				resultBuffer[0] = 'V';
+				WriteLog(__TEXT("file has virus"));
+				break; // Ïðåêðàùàåì ñêàíèðîâàíèå ïðè íàõîæäåíèè âèðóñà
+			}
+		}
+	} while (FindNextFile(hFind, &findFileData) != 0); // ïðîäîëæàåì ïîêà åñòü ôàéëû èëè ïàïêè
+
+	FindClose(hFind);
+
+	if (resultBuffer[0] != 'V')
+		resultBuffer[0] = 'N'; // Åñëè âèðóñ íå íàéäåí â ïàïêå
+
 }
 bool Check(BOOL statement)
 {
